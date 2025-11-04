@@ -23,5 +23,7 @@ To install the package in editable mode, run:
 poetry install
 ```
 
+You can add your own utilities/functions to the `utils/` folder as needed.
 
 Please email me if you have any problems, and I will do my best to help!
+If you need PDF versions of the solution notebooks, I can try to provide those as well.
