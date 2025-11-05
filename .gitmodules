@@ -1,0 +1,3 @@
+[submodule "submodules/gnss-tools"]
+	path = submodules/gnss-tools
+	url = https://github.com/cu-sense-lab/gnss-tools.git

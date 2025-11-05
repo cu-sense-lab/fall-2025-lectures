@@ -8,6 +8,7 @@ authors = [
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "gnss-tools @ file:///C:/Users/brian/projects/gnss-lectures/submodules/gnss-tools"
     
 ]
 
@@ -16,6 +17,10 @@ packages = [{include = "utils"}]
 
 [tool.poetry.group.dev.dependencies]
 nbstripout = "^0.8.1"
+
+
+[tool.poetry.group.test.dependencies]
+pytest = "^8.4.2"
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
