@@ -21,6 +21,8 @@ nbstripout = "^0.8.1"
 
 [tool.poetry.group.test.dependencies]
 pytest = "^8.4.2"
+ipykernel = "^7.1.0"
+matplotlib = "^3.10.7"
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]

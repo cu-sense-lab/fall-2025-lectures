@@ -1,10 +1,10 @@
 
 ## Installation
 
-If you know what you're doing and want to use your own environment (`uv`, `.venv`, etc.), go for it!
+If you know what you're doing and want to use your own virtual environment manager (`uv`, `venv`, etc.), go for it!
 
 Personally, I use conda, and the following instructions assume it is installed on your system.
-E.g. you may use miniforge, located here: https://github.com/conda-forge/miniforge
+If you don't have conda, you may download miniforge, located here: https://github.com/conda-forge/miniforge
 
 It also assumes you have the `poetry` package manager installed.  (I do this because I find its dependency resolution to be better..)
 See install here:  https://python-poetry.org/docs/
@@ -24,8 +24,12 @@ conda activate gnss_lectures
 To install the package in editable mode, run:
 
 ```bash
+git submodule update --init --recursive
 poetry install
 ```
+
+Note: there is a submodule `gnss-tools` in this repository that contains some utility functions.  It is another github repository, located here:
+https://github.com/cu-sense-lab/gnss-tools
 
 ## Usage
 
