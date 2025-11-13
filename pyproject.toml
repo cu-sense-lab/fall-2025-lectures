@@ -8,8 +8,7 @@ authors = [
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "gnss-tools @ file:///C:/Users/brian/projects/gnss-lectures/submodules/gnss-tools"
-    
+    "gnss-tools @ ./submodules/gnss-tools"
 ]
 
 [tool.poetry]
@@ -17,11 +16,6 @@ packages = [{include = "utils"}]
 
 [tool.poetry.group.dev.dependencies]
 nbstripout = "^0.8.1"
-pyvista = {extras = ["jupyter"], version = "^0.46.4"}
-trame = "^3.12.0"
-trame-vtk = "^2.10.0"
-googlemaps = "^4.10.0"
-
 
 [tool.poetry.group.test.dependencies]
 pytest = "^8.4.2"
