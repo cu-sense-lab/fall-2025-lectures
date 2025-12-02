@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, Optional, Generator
 import numpy as np
 
 
@@ -191,3 +191,73 @@ def convert_to_complex64_samples(
             output_sample_array[3::4] = comp4
     else:
         raise NotImplemented()
+
+
+def mixdown_samples(
+        input_samples: np.ndarray[np.complex64],
+        output_samples: np.ndarray[np.complex64],
+        samp_rate: float,
+        initial_phase_cycles: float,
+        freq_hz: float,
+) -> None:
+    """
+    Mixdown of complex samples by given frequency.
+
+    Args:
+        input_samples: Complex samples to mix down.
+        output_samples: Output array to store mixed signal.
+        samp_rate: Sample rate in Hz.
+        initial_phase_cycles: Initial phase offset in cycles.
+        freq_hz: Frequency in Hz to mix down by.
+    """
+    num_samples = input_samples.shape[0]
+    time_indices = np.arange(num_samples) / samp_rate
+    mixdown_phase = 2.0 * np.pi * (freq_hz * time_indices + initial_phase_cycles)
+    output_samples[:] = np.exp(-1j * mixdown_phase).astype(np.complex64)
+    output_samples *= input_samples
+
+
+class FileSampleStream:
+
+    def __init__(
+            self,
+            filepath: str,
+            sample_params: SampleParameters,
+            buffer_size_samples: int,
+            block_size_samples: int,
+        ) -> None:
+        self.filepath = filepath
+        self.sample_params = sample_params
+        if buffer_size_samples % block_size_samples != 0:
+            raise ValueError("Buffer size must be a multiple of block size.")
+        num_blocks_in_buffer = buffer_size_samples // block_size_samples
+        self.buffer_size_samples = buffer_size_samples
+        self.block_size_samples = block_size_samples
+        self.num_blocks_in_buffer = num_blocks_in_buffer
+        self.buffer_size_bytes = compute_sample_array_size_bytes(
+            buffer_size_samples, sample_params.bit_depth, sample_params.is_complex
+        )
+        self.byte_buffer = bytearray(self.buffer_size_bytes)
+        self.sample_buffer = np.zeros(buffer_size_samples, dtype=np.complex64)
+    
+    def __enter__(self):
+        self.file = open(self.filepath, "rb")
+        return self
+    
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.file.close()
+    
+    def sample_block_generator(self) -> Generator[np.ndarray]:
+        while True:
+            num_bytes_read = self.file.readinto(self.byte_buffer)
+            if num_bytes_read < self.buffer_size_bytes:
+                raise StopIteration
+            convert_to_complex64_samples(
+                self.byte_buffer,
+                self.sample_buffer,
+                self.sample_params,
+            )
+            for block_idx in range(self.num_blocks_in_buffer):
+                start_idx = block_idx * self.block_size_samples
+                end_idx = start_idx + self.block_size_samples
+                yield self.sample_buffer[start_idx:end_idx]

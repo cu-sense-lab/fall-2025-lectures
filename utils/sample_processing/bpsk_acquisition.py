@@ -2,62 +2,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 import numpy as np
-
-
-# There are various parameters that go into the coarse acquisition process.
-# We partition these parameters into two groups:
-# 1. Parameters that are common to all signals; we call thsese the `AcquisitionProcessorParameters`.
-# 2. Parameters that are specific to each signal; we call these the `SignalAcquisitionParameters`.
-#
-# The coarse acquisiton result includes references to both of these parameter groups, as well as
-# the estimated signal state, SNR, and correlation array.
-
-
-@dataclass
-class AcquisitionConfiguration:
-    replica_duration_ms: int
-    num_blocks: int
-    block_step_ms: int
-    sample_rate: int
-
-    def __post_init__(self):
-        self.replica_length_samples = int(
-            self.sample_rate * self.replica_duration_ms / 1000
-        )
-        self.replica_time_arr = (
-            np.arange(self.replica_length_samples) / self.sample_rate
-        )
-
-        # self.block_size_samples = 1 << (self.replica_length_samples - 1).bit_length()
-        self.block_size_samples = self.replica_length_samples
-        self.block_duration_seconds = self.block_size_samples / self.sample_rate
-        self.fft_resolution = 1 / self.block_duration_seconds
-        assert self.num_blocks > 0
-        self.acq_total_duration_ms = (
-            self.num_blocks - 1
-        ) * self.block_step_ms + self.replica_duration_ms
-        self.total_num_samples = int(
-            self.acq_total_duration_ms / 1000 * self.sample_rate
-        )
-
-@dataclass
-class AcqSignalCodeParameters:
-    rate_chips_per_sec: float
-    length_chips: int
-    sequence: np.ndarray[np.int8]
-
-import utils.signals.gps_l1ca as gps_l1ca
-GPS_L1CA_ACQ_CODE_PARAMS = {
-    f"G{prn:02}": AcqSignalCodeParameters(
-        code_rate_chips_per_sec=gps_l1ca.CODE_RATE,
-        code_length_chips=gps_l1ca.CODE_LENGTH,
-        code_sequence=gps_l1ca.get_GPS_L1CA_code_sequence(prn),
-    ) for prn in range(1, 33)
-}
-
-@dataclass
-class AcquisitionResult:
-    pass
+import scipy.stats
 
 
 @dataclass
@@ -66,182 +11,209 @@ class SignalReplicaCacheEntry:
     replica_fft: np.ndarray
 
 
-class AcquisitionProcessor_BPSK:
+@dataclass
+class AcquisitionConfiguration:
+    replica_duration_ms: int
+    num_blocks: int
+    sample_rate: int
+    min_search_doppler_hz: float
+    max_search_doppler_hz: float
+
+    def __post_init__(self):
+        self.replica_length_samples = int(
+            self.sample_rate * self.replica_duration_ms / 1000
+        )
+        self.replica_time_arr = (
+            np.arange(self.replica_length_samples) / self.sample_rate
+        )
+        self.block_size_samples = self.replica_length_samples
+        self.block_duration_seconds = self.block_size_samples / self.sample_rate
+        self.fft_resolution = 1 / self.block_duration_seconds
+        assert self.num_blocks > 0
+        self.acq_total_duration_ms = self.num_blocks * self.replica_duration_ms
+        self.total_num_samples = int(
+            self.acq_total_duration_ms / 1000 * self.sample_rate
+        )
+        self.min_doppler_fft_bin = int(
+            self.min_search_doppler_hz / self.fft_resolution
+        )
+        self.max_doppler_fft_bin = int(
+            self.max_search_doppler_hz / self.fft_resolution
+        )
+        self.doppler_search_bins = np.arange(self.min_doppler_fft_bin, self.max_doppler_fft_bin)
+        self.num_doppler_bins = len(self.doppler_search_bins)
+
+        self.replica_cache_dict: Dict[str, SignalReplicaCacheEntry] = {}
+
+
+@dataclass
+class AcqSignalCodeParameters:
+    rate_chips_per_sec: float
+    length_chips: int
+    sequence: np.ndarray[np.int8]
+
+
+@dataclass
+class CorrelationResult:
+    correlation_matrix: np.ndarray[np.float64]
+    start_doppler_hz: float
+    doppler_resolution_hz: float
+    start_code_phase_seconds: float
+    code_phase_resolution_seconds: float
+
+    @property
+    def num_doppler_bins(self) -> int:
+        return self.correlation_matrix.shape[0]
+    
+    @property
+    def num_code_phase_bins(self) -> int:
+        return self.correlation_matrix.shape[1]
+    
+    @property
+    def doppler_bins_hz(self) -> np.ndarray[np.float64]:
+        return self.start_doppler_hz + np.arange(self.num_doppler_bins) * self.doppler_resolution_hz
+    
+    @property
+    def code_phase_bins_seconds(self) -> np.ndarray[np.float64]:
+        return self.start_code_phase_seconds + np.arange(self.num_code_phase_bins) * self.code_phase_resolution_seconds
+
+
+@dataclass
+class AcquisitionResult:
+    signal_id: str
+    peak_doppler_bin: int
+    peak_code_phase_bin: int
+    normalized_peak_value: float
+    prob_false_alarm: float
+    detection_threshold: float
+    noise_var: float
+    signal_detected: bool
+    correlation_result: CorrelationResult
+    config: AcquisitionConfiguration
+
+    @property
+    def acq_doppler_hz(self) -> float:
+        return self.correlation_result.start_doppler_hz + self.peak_doppler_bin * self.correlation_result.doppler_resolution_hz
+    
+    @property
+    def acq_code_phase_seconds(self) -> float:
+        return self.correlation_result.start_code_phase_seconds + self.peak_code_phase_bin * self.correlation_result.code_phase_resolution_seconds
+    
+
+def run_acquisition(
+    sample_block: np.ndarray[np.complex64],
+    acq_config: AcquisitionConfiguration,
+    code_parameters: Dict[str, AcqSignalCodeParameters],
+    prob_false_alaram: float,
+    print_progress: bool = False,
+) -> Dict[str, AcquisitionResult]:
     """
-    Performs coarse acquisition for a set of BPSK signals.
+    Perform BPSK acquisition on the given sample block for all signals defined in code_parameters.
 
-    Acquisition parameters are stored for each signal in the `acq_params` dictionary.
+    Returns a dictionary mapping signal IDs to their respective AcquisitionResult.
 
-    Pre-computed replicas and FFTs are stored for each signal in the `replica_cache` dictionary.
+    Pre-computed replicas and FFTs are stored for each signal in the config `replica_cache_dict`.
     The values in the cache entries must be recomputed when acquisition parameters change or when the sampling rate changes.
     """
+    acquisition_results: Dict[str, AcquisitionResult] = {}
 
-    def __init__(
-        self,
-        acq_config: AcquisitionConfiguration,
-        code_parameters: Dict[str, AcqSignalCodeParameters],
-    ):
-        self.acq_config = acq_config
-        self.code_parameters = code_parameters
-        self.replica_cache_entry_dict: Dict[str, SignalReplicaCacheEntry] = {}
+    #
+    # Reshape sample block into M blocks of N samples
+    M = acq_config.num_blocks
+    N = acq_config.block_size_samples
+    samples = sample_block[: M * N].reshape((M, N))
+    # Compute FFT of blocks
+    samples_fft = np.fft.fft(samples, axis=1)
 
-        # We internally store all acquisition results for caching and debug purposes
-        self.acq_results_dict: Dict[str, AcquisitionResult] = {}
+    for signal_id, code_params in code_parameters.items():
 
+        if print_progress:
+            print(f"Acquiring signal {signal_id}...", end="")
 
-    def process_sample_block(
-        self,
-        sample_block: np.ndarray[np.complex64]
-    ) -> bool:
+        # Check if there is a cached replica for this signal
+        if signal_id in acq_config.replica_cache_dict:
+            replica_entry = acq_config.replica_cache_dict[signal_id]
+            replica_samples_fft = replica_entry.replica_fft
+        else:
+            replica_samples = np.zeros(
+                acq_config.block_size_samples, dtype=np.complex64
+            )
+            chips_arr = 0.0 + acq_config.replica_time_arr * code_params.rate_chips_per_sec
+            chip_indices = chips_arr.astype(int) % code_params.length_chips
+            replica_samples[:acq_config.replica_length_samples] = code_params.sequence[chip_indices].astype(float)
+            replica_samples_fft = np.fft.fft(replica_samples)
+            replica_entry = SignalReplicaCacheEntry(
+                replica_samples, replica_samples_fft
+            )
+            acq_config.replica_cache_dict[signal_id] = replica_entry
+
+        doppler_search_bins = acq_config.doppler_search_bins
+        correlation = np.zeros(
+            (len(doppler_search_bins), acq_config.block_size_samples)
+        )
+
+        for i, roll in enumerate(doppler_search_bins):
+            # coherent integration over N samples; z_noise ~ CN(0, N*sigma_n**2)
+            corr = (
+                np.fft.ifft(
+                    np.conj(np.roll(samples_fft, -roll, axis=1)) * replica_samples_fft[None, :]
+                )
+            )
+            # non-coherent square-law summation over M blocks, normalized by N
+            # y_noise / sigma_n**2 ~ ChiSquared(2M)
+            correlation[i] = np.sum(
+                1 / N * np.abs(corr)**2, axis=0
+            )
         
-        if (
-            len(sample_block)
-            < self.acq_config.acq_total_duration_ms / 1000 * self.acq_config.sample_rate
-        ):
-            logging.error(
-                "Insufficient samples to perform acquisition"
-            )  # change to logger
-            return False
+        # Find acquisition peak
+        peak_doppler_bin, peak_sample_bin = np.unravel_index(
+            correlation.argmax(), correlation.shape
+        )
+        peak_val = correlation[peak_doppler_bin, peak_sample_bin]
+        
+        # Estimate noise distribution
+        # E[y_noise] = M * sigma_n**2
+        # Var[y_noise] = 2 * M * sigma_n**4
+        # Don't worry about peak
+        y_noise_mean = np.mean(correlation)
+        noise_var = y_noise_mean / (2 * acq_config.num_blocks)
+        # Another way to estimate noise stddev
+        # y_noise_var = np.var(correlation)
+        # noise_level = np.sqrt(np.sqrt(y_noise_var / (4 * acq_config.num_blocks)))
 
-        M = self.acq_config.num_blocks
-        N = self.acq_config.block_size_samples
-        samples = sample_block[: M * N].reshape((M, N))
-        samples_var = np.var(
-            samples[0, :]
-        )  # <- Estimate of raw sample variance, can be used for noise stats
-        samples_fft = np.fft.fft(samples, axis=1)
+        normalized_peak_value = peak_val / noise_var
+        chi2 = scipy.stats.chi2(df=2 * acq_config.num_blocks)
+        detection_threshold = chi2.ppf(1 - prob_false_alaram)
+        signal_detected = normalized_peak_value > detection_threshold
 
-        for signal_id, code_params in self.code_parameters.items():
+        # Not a true SNR, just approx estimate useful for display
+        # peak_snr = peak_val / (2 * acq_config.num_blocks * noise_var)
+        # peak_snr_dB = 10 * np.log10(peak_snr)
 
-            # Check if there is a cached replica for this signal
-            if signal_id in self.replica_cache_entry_dict:
-                replica_entry = self.replica_cache_entry_dict[signal_id]
-                replica_samples_fft = replica_entry.replica_fft
-            else:
-                replica_samples = np.zeros(
-                    self.acq_config.block_size_samples, dtype=np.complex64
-                )
-                chips_arr = 0.0 + self.acq_config.replica_time_arr * code_params.rate_chips_per_sec
-                chip_indices = chips_arr.astype(int) % code_params.length_chips
-                replica_samples[:self.acq_config.replica_length_samples] = code_params.sequence[chip_indices].astype(float)
-                replica_samples_fft = np.fft.fft(replica_samples)
-                replica_entry = SignalReplicaCacheEntry(
-                    replica_samples, replica_samples_fft
-                )
-                self.replica_cache_entry_dict[signal_id] = replica_entry
+        corr_result = CorrelationResult(
+            correlation,
+            acq_config.doppler_search_bins[0] * acq_config.fft_resolution,
+            acq_config.fft_resolution,
+            0.0,
+            1 / acq_config.sample_rate,
+        )
 
-            min_doppler_fft_bin = int(
-                sig_acq_params.search_doppler_min_hz / self.acq_config.fft_resolution
-            )
-            max_doppler_fft_bin = int(
-                sig_acq_params.search_doppler_max_hz / self.acq_config.fft_resolution
-            )
-            doppler_search_bins = range(min_doppler_fft_bin, max_doppler_fft_bin)
-            correlation = np.zeros(
-                (len(doppler_search_bins), self.acq_config.block_size_samples)
-            )
+        acq_result = AcquisitionResult(
+            signal_id,
+            peak_doppler_bin,
+            peak_sample_bin,
+            normalized_peak_value,
+            prob_false_alaram,
+            detection_threshold,
+            noise_var,
+            signal_detected,
+            corr_result,
+            acq_config,
+        )
 
-            for i, roll in enumerate(doppler_search_bins):
-                corr = (
-                    1 / (N * samples_var) * np.fft.ifft(
-                        np.conj(np.roll(samples_fft, -roll, axis=1)) * replica_samples_fft[None, :]
-                    )
-                )
-                correlation[i] = np.sum(
-                    np.abs(corr) ** 2, axis=0
-                )  # <- noise should be chi-squared with M deg of freedom
-                # but we don't really know the noise distribution because correlation sidelobes are mixed in if signal is strong
-                # therefore, first find peak, then estimate noise distr, the compute threshold
+        acquisition_results[signal_id] = acq_result
 
-            # Compute number of samples in one code period
-            num_samples_per_code_period = int(
-                code_params.length / code_params.rate * self.acq_config.sample_rate
-            )
-            correlation = correlation[:, :num_samples_per_code_period]
-
-            # Find acquisition peak
-            dopp_bin, sample_bin = np.unravel_index(
-                correlation.argmax(), correlation.shape
-            )
-            max_val = correlation[dopp_bin, sample_bin]
-
-            # Notes on noise distribution:
-            #  N noise samples are summed to produce Gaussian noise with `N * samp_var` variance
-            #  The magnitude of those complex noise samples is added `M` times
-            #  The noise cells in the resulting correlation array have chi-squared distribution with
-            #  `2 * M` degrees of freedom.  We will approximate that the cell containing our signal
-            #  peak has magnitude `M * A**2 + noise`
-            # TODO: is there a better way of computing noise var?  should fit to chi squared?
-            # import numpy as np
-
-            # import scipy.stats
-
-            # scipy.stats.chi2()
-            # scipy.stats.chi2.ppf()
-
-            # false alarm rate of alpha = 0.00001
-            # raw sample noise std of sigma
-            # coherent gain of N samples, leads to amplitude N*A and noise std of sqrt(N) * sigma
-            # normalize this result to get signal peak of sqrt(N) * A / sigma and noise std of 1
-            # non-coherent integration of M blocks of squared amplitude leads to noise bins with chi2 with 2*M degrees of freedom
-            # and signal peak of N * A**2 / sigma**2
-            # but the main point really is that, under than normalization scheme, the CFAR threshold is related to CDF of chi2
-
-            noise_var = (np.var(correlation) * correlation.size - max_val**2) / (
-                correlation.size - 1
-            )
-
-            # Estimate SNR and CNR
-            acq_snr = max_val**2 / noise_var
-            acq_snr_db = 10 * np.log10(acq_snr)
-            # noise_mean_est = M * np.sqrt(N)
-            # A_est = np.sqrt(max_val - noise_mean_est)
-            # cnr_est = A_est**2 / samples_var * self.samp_rate
-
-            # Calculate Doppler from dopp bin offset
-            acq_doppler_hz = (
-                min_doppler_fft_bin + dopp_bin
-            ) * self.acq_config.fft_resolution
-
-            # Calculate code phase from sample phase
-            # TODO: when should this include Doppler effect on code phase?
-            #  did this calculation -- almost never, but double check for higher frequencies..
-            # acq_code_phase_chips = sample_bin * sig_params.mod.code.rate / samp_rate
-            # acq_code_phase: GTime = GTime.from_float_seconds(acq_code_phase_chips / sig_params.mod.code.rate)
-            acq_code_phase_seconds = sample_bin / self.acq_config.sample_rate
-
-            acq_corr_result = CorrelationResult(
-                correlation,
-                min_doppler_fft_bin * self.acq_config.fft_resolution,
-                self.acq_config.fft_resolution,
-                0.0,
-                1
-                / self.acq_config.sample_rate,  # TODO: is this right for doppler compression/expansion case?
-            )
-
-            acq_result = AcquisitionResult_BPSK(
-                signal_id,
-                block_start_epoch_uptime,
-                acq_doppler_hz,
-                acq_code_phase_seconds,
-                acq_snr_db,
-                acq_corr_result,
-                self.acq_config,
-                sig_acq_params,
-            )
-            
-            self.acq_results_dict[signal_id] = acq_result
-
-            # First check if SNR passed acq threshold, and if not, continue
-            if acq_snr_db < sig_acq_params.snr_threshold_db:
-                # print(f"Failed to acquire: {signal_id}: {acq_result}")
-                # logging.log(2, f"Failed to acquire: {signal_id}: {acq_result}")
-                continue
-
-            # logging.log(2, f"Acquired: {signal_id}: {acq_result}")
-            print(f"Acquired: {signal_id}: {acq_result}")
-            # Otherwise, append the acquisition result to the acquired signals list
-            self._acquired_signals.append(acq_result)
-
-        return StatusCode.OKAY
-
+        if print_progress:
+            print(f"{normalized_peak_value:6.3f}{'*' if signal_detected else ''}", end="\n")
+    
+    return acquisition_results
