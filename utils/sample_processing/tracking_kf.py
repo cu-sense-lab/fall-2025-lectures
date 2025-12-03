@@ -1,66 +1,13 @@
 import numpy as np
 from dataclasses import dataclass
+from .tracking import (
+    TrackingSignalState,
+    TrackingSignalParameters,
+    TrackingLoopParameters,
+    SignalTrackingOutputs,
+)
 from .correlation import correlate__delay
 
-@dataclass
-class TrackingSignalState:
-    uptime_epoch_seconds: float  # time at which state is valid
-    code_phase_seconds: float
-    carrier_phase_cycles: float
-    doppler_freq_hz: float
-
-
-@dataclass
-class TrackingSignalParameters:
-    code_seq: np.ndarray[np.int8]
-    nominal_code_rate_chips_per_sec: float
-    carrier_freq_hz: float
-
-    @property
-    def code_length_chips(self) -> int:
-        return len(self.code_seq)
-
-@dataclass
-class SignalTrackingOutputs:
-
-    def __init__(self, output_capacity: int):
-        self.uptime_seconds = np.zeros(output_capacity, dtype=float)
-        self.carr_phase_errors_cycles = np.zeros(output_capacity, dtype=float)
-        self.code_phase_errors_chips = np.zeros(output_capacity, dtype=float)
-        self.early_corr = np.zeros(output_capacity, dtype=complex)
-        self.prompt_corr = np.zeros(output_capacity, dtype=complex)
-        self.late_corr = np.zeros(output_capacity, dtype=complex)
-        self.carr_phase_cycles = np.zeros(output_capacity, dtype=float)
-        self.doppler_freq_hz = np.zeros(output_capacity, dtype=float)
-        self.code_phase_seconds = np.zeros(output_capacity, dtype=float)
-
-        self.output_index = 0
-
-
-@dataclass
-class TrackingLoopParameters:
-    PLL_bandwidth_hz: float
-    DLL_bandwidth_hz: float
-    update_period_ms: float
-    block_duration_ms: int
-    samp_rate: float
-    EPL_chip_spacing: float = 0.5  # chips
-
-    def __post_init__(self):
-        # Compute block sample time array
-        block_duration_seconds = self.block_duration_ms * 1e-3
-        num_samples_per_block = int(self.samp_rate * block_duration_seconds)
-        self.block_sample_time_arr = np.arange(num_samples_per_block) / self.samp_rate
-        # Compute loop filter coefficients
-        update_period_seconds = self.update_period_ms * 1e-3
-        self.DLL_filter_coeff = 4 * update_period_seconds * self.DLL_bandwidth_hz
-        xi = 1 / np.sqrt(2)
-        omega_n = self.PLL_bandwidth_hz / .53
-        self.PLL_filter_coeffs = (
-            2 * xi * omega_n * update_period_seconds 
-            - 3 / 2 * omega_n**2 * update_period_seconds**2,
-            omega_n**2 * update_period_seconds
-        )
 
 def track_signal(
     uptime_seconds: float,

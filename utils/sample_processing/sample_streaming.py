@@ -213,8 +213,8 @@ def mixdown_samples(
     num_samples = input_samples.shape[0]
     time_indices = np.arange(num_samples) / samp_rate
     mixdown_phase = 2.0 * np.pi * (freq_hz * time_indices + initial_phase_cycles)
-    output_samples[:] = np.exp(-1j * mixdown_phase).astype(np.complex64)
-    output_samples *= input_samples
+    output_samples[...] = input_samples[...] * np.exp(-1j * mixdown_phase)
+    
 
 
 class FileSampleStream:
